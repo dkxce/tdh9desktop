@@ -69,7 +69,6 @@ KISS-фрейм: [0xC0][port:cmd][escape(AX.25)][0xC0]
 
 ```bash
 pip install bleak
-cd tidradio_kiss
 python main.py
 ```
 
@@ -271,3 +270,10 @@ python main.py
 
 Программа — **авторский проект dkxce** (с) https://github.com/dkxce.       
 Написана для совместимости с TIDRadio TD-H9.
+
+---
+
+## 13. Скриншоты
+
+<img src="images/screen1.png"/>    
+<img src="images/screen2.png"/>    
