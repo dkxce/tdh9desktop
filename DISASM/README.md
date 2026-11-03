@@ -1,5 +1,7 @@
 # APRS через BLE: анализ приложения Odmaster и реализация TNC-модема на Python
 
+[RU](README.md) | [EN](README.en.md)     
+
 **APK:** `Odmaster_2.6.4.apk`    
 **Декомпиляция APK:** `Ajadx-gui`    
 **Пакет APRS в APK:** `com.tid.aprs`    
