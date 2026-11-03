@@ -89,7 +89,7 @@ jobs:
               # Вычисляем имя выходного файла
               if "_ru.md" in file_name:
                   out_name = file_name.replace("_ru.md", ".en.md")
-              elif ".ru.md" in file_name:
+              elif "-ru.md" in file_name:
                   out_name = file_name.replace("-ru.md", ".en.md")
               elif ".ru.md" in file_name:
                   out_name = file_name.replace(".ru.md", ".en.md")
