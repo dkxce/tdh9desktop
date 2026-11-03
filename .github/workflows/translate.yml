@@ -90,6 +90,8 @@ jobs:
               if "_ru.md" in file_name:
                   out_name = file_name.replace("_ru.md", ".en.md")
               elif ".ru.md" in file_name:
+                  out_name = file_name.replace("-ru.md", ".en.md")
+              elif ".ru.md" in file_name:
                   out_name = file_name.replace(".ru.md", ".en.md")
               else:
                   out_name = file_name.replace(".md", ".en.md")
@@ -160,4 +162,4 @@ jobs:
           # Находим и индексируем новые файлы .md по всему дереву репозитория
           git add "**.en.md" 2>/dev/null || true
           
-          git diff --quiet && git diff --staged --quiet || (git commit -m "docs: tree-based markdown translate preserving directory paths" && git push)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "docs: autotranslate" && git push)
