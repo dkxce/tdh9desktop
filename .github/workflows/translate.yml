@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'README.md'
+      - 'DISASM/README.md'
   workflow_dispatch:
 
 permissions:
@@ -29,6 +30,7 @@ jobs:
           python -c "
           import argostranslate.package
           import argostranslate.translate
+          import os
 
           # Обновляем индекс пакетов и скачиваем модель с русского на английский
           argostranslate.package.update_package_index()
@@ -41,23 +43,26 @@ jobs:
           )
           argostranslate.package.install_from_path(package_to_install.download())
 
-          # Считываем русский README
-          with open('README.md', 'r', encoding='utf-8') as f:
-              text = f.read()
+          # Функция для перевода одного файла
+          def translate_file(src, dest):
+              if not os.path.exists(src):
+                  return
+              with open(src, 'r', encoding='utf-8') as f:
+                  text = f.read()
+              translated_text = argostranslate.translate.translate(text, 'ru', 'en')
+              with open(dest, 'w', encoding='utf-8') as f:
+                  f.write(translated_text)
 
-          # Локально переводим весь текст (без HTTP запросов в интернет)
-          translated_text = argostranslate.translate.translate(text, 'ru', 'en')
-
-          # Записываем результат
-          with open('README.en.md', 'w', encoding='utf-8') as f:
-              f.write(translated_text)
+          # Переводим оба файла
+          translate_file('README.md', 'README.en.md')
+          translate_file('DISASM/README.md', 'DISASM/README.en.md')
           "
 
-      # 3. Сохраняем готовый файл в репозиторий
+      # 3. Сохраняем готовые файлы в репозиторий
       - name: Commit & Push changes
         run: |
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.email "41898282+github-actions[bot]@://github.com"
           git config --local user.name "github-actions[bot]"
-          git add README.en.md
-          git diff --quiet && git diff --staged --quiet || git commit -m "docs: auto-translate README to English"
+          git add README.en.md DISASM/README.en.md
+          git diff --quiet && git diff --staged --quiet || git commit -m "docs: auto-translate READMEs to English"
           git push

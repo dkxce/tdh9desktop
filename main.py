@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import webbrowser
 import datetime
 import queue
 import threading
@@ -111,10 +112,13 @@ class App:
         self.nb.pack(fill="x", padx=8, pady=(6, 0))
         tab1 = ttk.Frame(self.nb)
         tab2 = ttk.Frame(self.nb)
+        tab3 = ttk.Frame(self.nb)
         tab1.configure(height=320)
         tab2.configure(height=320)
+        tab3.configure(height=320)
         self.nb.add(tab1, text="TNC & TX")
         self.nb.add(tab2, text="Server & IGate")
+        self.nb.add(tab3, text="About")
 
         # ============ Tab 1: device + transmit ============
         # --- top: device selection / выбор устройства
@@ -213,7 +217,47 @@ class App:
         # --- IGate settings form / форма настроек IGate
         ig = ttk.LabelFrame(tab2, text="IGate (Radio <-> APRS-IS)")
         ig.pack(fill="x", padx=8, pady=6)
+        
+        # ============ Tab 3: About ============
+        
+        about = ttk.LabelFrame(tab3, text="About")
+        about.pack(fill="x", padx=8, pady=2)
 
+        bold_font = ("TkDefaultFont", 9, "bold")
+
+        ttk.Label(about, text="BLE KISS TNC over TCP/IP", font=bold_font).pack(side="top", anchor="w", padx=5, pady=(5, 1))
+        ttk.Label(about, text="Version: v1.1.0").pack(side="top", anchor="w", padx=5, pady=1)
+        ttk.Label(about, text="Author: dkxce").pack(side="top", anchor="w", padx=5, pady=1)
+
+        def create_link_with_prefix(parent, prefix_text, url):
+            """Создаёт строку с обычным префиксом и кликабельной ссылкой."""
+            row_frame = tk.Frame(parent)
+            row_frame.pack(side="top", anchor="w", padx=5, pady=1)
+            
+            # Префикс (не кликабельный)
+            ttk.Label(row_frame, text=prefix_text).pack(side="left")
+            
+            # Кликабельная ссылка
+            link_label = tk.Label(row_frame, text=url, fg="blue", cursor="hand2")
+            link_label.pack(side="left")
+            link_label.bind("<Button-1>", lambda e: webbrowser.open_new_tab(url))
+            
+            return row_frame
+
+        create_link_with_prefix(about, "GitHub: ", "https://github.com/dkxce")
+        create_link_with_prefix(about, "Project (Desktop): ", "https://github.com/dkxce/tdh9desktop")
+        create_link_with_prefix(about, "Android version: ", "https://github.com/dkxce/tdh9android")
+        create_link_with_prefix(about, "Main repository: ", "https://github.com/dkxce/Tidradio-TD-H9")
+
+        ttk.Label(
+            about, 
+            text="Bridge between the TIDRadio TD-H9 radio (BLE APRS service 0000af00) and external "
+                 + "APRS applications via local TCP servers.",
+            wraplength=400
+        ).pack(side="top", anchor="w", padx=5, pady=(5, 5))
+        
+        # ==========================================
+                
         self.igate_settings = load_settings()
         _c = self.igate_settings
 
