@@ -1,6 +1,6 @@
 @echo off
 
-rem # author  # https://github.com/dkxce/Tidradio-TD-H9
+rem # author  # https://github.com/dkxce/tdh9desktop
 rem # version # v1.0.0.0
 
 :begin
