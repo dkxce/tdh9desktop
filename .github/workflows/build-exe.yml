@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'version.md'  # Сборка сработает только если изменился этот файл
+  workflow_dispatch:  # Позволяет запустить сборку вручную в любой момент
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install dependencies
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        run: poetry install --no-interaction --no-root
+
+      - name: Create Version File
+        run: poetry run create-version-file TDH9KISS.yaml --outfile TDH9KISS.txt
+
+      - name: Build EXE with PyInstaller
+        run: |
+          poetry run pyinstaller --clean --version-file="TDH9KISS.txt" -i "TDH9KISS.ico" --noconsole --onefile --name=tdh9kiss main.py
+          if (Test-Path TDH9KISS.txt) { Remove-Item TDH9KISS.txt }
+
+      - name: Compress EXE with UPX
+        run: .\tools\upx.exe -9f dist\tdh9kiss.exe
+
+      - name: Save EXE to Job Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdh9kiss
+          path: dist/tdh9kiss.exe
+          compression-level: 0  # Отключаем зипование архива, так как UPX уже сжал exe
