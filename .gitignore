@@ -6,3 +6,4 @@
 /.vs
 /dist/*.zip
 /build
+/.chat.txt
