@@ -4,8 +4,8 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'version.md'  # Сборка сработает только если изменился этот файл
-  workflow_dispatch:  # Позволяет запустить сборку вручную в любой момент
+      - 'version.md'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -33,16 +33,23 @@ jobs:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
 
+      # Добавляем путь к Poetry в PATH текущей сессии Windows
+      - name: Add Poetry to PATH
+        run: |
+          echo "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install dependencies
         if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
-        run: poetry install --no-interaction --no-root
+        run: |
+          $env:USERPROFILE\.local\bin\poetry install --no-interaction --no-root
 
       - name: Create Version File
-        run: poetry run create-version-file TDH9KISS.yaml --outfile TDH9KISS.txt
+        run: |
+          $env:USERPROFILE\.local\bin\poetry run create-version-file TDH9KISS.yaml --outfile TDH9KISS.txt
 
       - name: Build EXE with PyInstaller
         run: |
-          poetry run pyinstaller --clean --version-file="TDH9KISS.txt" -i "TDH9KISS.ico" --noconsole --onefile --name=tdh9kiss main.py
+          $env:USERPROFILE\.local\bin\poetry run pyinstaller --clean --version-file="TDH9KISS.txt" -i "TDH9KISS.ico" --noconsole --onefile --name=tdh9kiss main.py
           if (Test-Path TDH9KISS.txt) { Remove-Item TDH9KISS.txt }
 
       - name: Compress EXE with UPX
@@ -53,4 +60,4 @@ jobs:
         with:
           name: tdh9kiss
           path: dist/tdh9kiss.exe
-          compression-level: 0  # Отключаем зипование архива, так как UPX уже сжал exe
+          compression-level: 0
