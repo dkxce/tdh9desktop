@@ -1,4 +1,4 @@
-# APRS via BLE: Analysis of the Odmaster application and implementation of the TNC modem in Python
+# APRS via BLE: analysis of the Odmaster application and implementation of the TNC modem in Python
 
 [RU](README.md) | [EN](README.en.md)
 
@@ -7,7 +7,7 @@
 **APRS package in APK:** `com.tid.aprs`
 
 This document contains a complete description of how the TNC modem works through
-Bluetooth: First, as it is done in a stock app**Odmaster**down
+Bluetooth: First – as it is done in a stock app**Odmaster**down
 Decompiled APK, then how to implement it**Python**.
 At the end is a comparison, a data flow chart, and a table of key constants.
 
@@ -16,7 +16,7 @@ At the end is a comparison, a data flow chart, and a table of key constants.
 ## 0. What is a TNC modem via BLE?
 
 On the radio.**TIDRadio TD-H9**hardware**TNC**(Terminal Node Controller):
-It itself modulates / demodulates the AFSK signal 1200 baud and exchanges with the external
+It modulates / demodulates the AFSK signal 1200 baud and exchanges with the external
 device (telephone/PC)**ready-made**protocolly**KISS**.
 
 The order of the data is always this:
@@ -42,7 +42,7 @@ Transmission to the radio (TX), notify-characteristics for reception from the ra
 ## 1. As done in APK Odmaster
 
 Odmaster uses the module`com.tid.aprs`.   
-Communication to the radio via Bluetooth.  
+Talk to the radio via Bluetooth.  
 Data is KISS on top of AX.25.  
 If necessary, IGate relay over TCP.
 
@@ -57,7 +57,7 @@ If necessary, IGate relay over TCP.
 
 ### 1.2 Classic Bluetooth (SPP RFCOMM)
 
-Background flow`BtSocketThread`connects via SPP:
+Background flow`BtSocketThread`connected via SPP:
 
 ```
 private UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
@@ -152,15 +152,15 @@ Ble.options()
 ### 1.5 Internet / IGate in APK
 
 Prix`isRadioToNet() && isAutoConnect()`The received package is published in RxBus
-?`BluetoothTnc.java:35`, `AprsMainActivity.java:210-216`) and enters the network through
-TCP + EasySocket. The network is used**textual**APRS?`AprsPacket.formatLogin`+ position) on TCP with 1024-byte read protocol.
+?`BluetoothTnc.java:35`, `AprsMainActivity.java:210-216`) and goes to the network through
+TCP + EasySocket. The network is used**textual**APRS.`AprsPacket.formatLogin`+ position) on TCP with 1024-byte read protocol.
 
 ---
 
 ## 2. How it is implemented in Python (TDH9KISS)
 
 TDH9KISS Repeats the BLE GATT Path`af00`write`af01`notify`af02`), but adds on top of mini servers (KISS/AGW/APRS-IS) and built-in IGate,
-so that external APRS applications and network can work with the radio.
+So that the radio can work with external APRS applications and the network.
 
 ### 2.1 Modules
 
@@ -168,9 +168,9 @@ so that external APRS applications and network can work with the radio.
 | --- | --- |
 | `main.py` | GUI (Tk), orchestration, two tabs, RX/TX log |
 | `ble_radio.py` | BLE-transport: scanning, connecting, reading GATT-services, sending / receiving personnel |
-| `gatt_info.py` | human-readable service descriptions/GATT characteristics |
+| `gatt_info.py` | human-readable descriptions of services / characteristics of GATT |
 | `kiss.py` | KISS protocol: escape/unescape, frame parser |
-| `ax25.py` | encoding/decoding binary AX.25 text APRS |
+| `ax25.py` | Encoding/decoding binary AX.25 text APRS |
 | `aprs_parser.py` | Analysis of APRS packet content (position, message, etc.) |
 | `kiss_tcp_server.py` | KISS TNC over TCP (port 8023) |
 | `agw_server.py` | AGWPE-compatible server (port 8000, 36-byte headers) |
@@ -245,7 +245,7 @@ body = bytes([cmd_byte]) + kiss_escape(ax25)
 return bytes([FEND]) + body + bytes([FEND])
 ```
 
-**parser** `KISSParser`incremental, processes bytes one by one
+**Parser** `KISSParser`incremental, processes bytes one by one
 ?`feed`) correctly experiences an escape sequence gap between TCP/BLE
 In portions. On the completed frame, calls`on_frame(port, command, payload)`.
 where`payload`De-escaped bytes AX.25.
@@ -289,7 +289,7 @@ Three sources, one way to the BLE radio:
 | APRS-IS client | `_client_tx_aprs(text)` → `encode_ax25_text` → `frame_kiss` → `ble.send_raw` |
 | IGate (network → radio) | `_igate_to_radio(bytes)` → `frame_kiss` → `ble.send_raw` |
 
-All paths eventually do`frame_kiss(ax25) и`ble.send raw(kiss frame)`. Каждый
+All paths eventually do`frame_kiss(ax25) и`ble.send raw (kiss frame)`. Каждый
 уходящий кадр пишется в`Journal and History (MRU).
 
 ### 2.7 TCP servers (external APRS applications)
@@ -302,12 +302,12 @@ In the GUI tab "Server & IGate" you can select the mode:
 * **AGW (AGWPE)** (`agw_server.py`Port 8000 is compatible with Dire Wolf. 36-byte
   headline:`portx(1) res(3) datakind(1) res(1) pid(1) res(1) from(10) to(10)
   len(4 LE) reserved(4)`. Processing TX.`V`/`M`(UI frames, 1 byte number)
-  Dji + 10 bytes per Dji + info,`K`(raw AX.25) and monitor`U`for RX.
+  DJ + 10 bytes per DJ + info,`K`(raw AX.25) and monitor`U`for RX.
 * **APRS-IS** (`aprsis_server.py`Port 14580: Text protocol. Login.`user CALL pass PASSCODE vers ... filter ...`It is necessary to check passcode.
   by algorithm`compute_passcode`Unauthorized - read-only, lines`#`They don't go to the radio. Incoming text from the client is encoded in AX.25 and goes into the
   radio.
 
-### 2.8 IGate (radio and APRS-IS) and settings.json
+### 2.8 IGate (radio и APRS-IS) and settings.json
 
 `igate.py`Independent IGate module:
 
@@ -328,7 +328,7 @@ user <APRSIS_CLIENT> pass <PASSCODE> vers TDH9KissIGate v1.0 filter <FILTER>
 
 The default filter is`d/<IGATE_NAME>*`(to the addressee, without SSID). If the paragraph`Filter`No filter is given - it is substituted`d/<без SSID>*`for example`DKXCE-11` → `d/DKXCE*`).
 
-**Live application of settings:**Each packet reads the current flags through`settings_getter` (`_igate_live_settings`), therefore switching checkboxes
+**Live application of settings:**Each packet reads the current flag through`settings_getter` (`_igate_live_settings`), therefore switching checkboxes
 (Require TCPIP / Reject qAR / Reject qAO) applies instantly, without restarting.
 
 **`settings.json`**stored in the module folder`tidradio_kiss/settings.json`. Contains.`aprsis_client`, `igate_name`, `passcode`, `server`, `port`, `filter`, `enabled`,
@@ -353,7 +353,7 @@ Example:
 ```
 
 **GUI IGATE:**button**Start/stop**(toggle), no separate Stop and Save.
-At the start, the current shape values are applied and stored. The IGate log is spelled
+At the start, the current shape values are applied and stored. IGate's log is spelled
 common-window`RX/TX Log`.
 
 ### Interface (GUI)
@@ -361,7 +361,7 @@ common-window`RX/TX Log`.
 * `main.py`builder`ttk.Notebook`with two tabs:
 * tab**"TNC & TX"**Select the device (Scan/Connect/Disconnect)
   History, status, Transmit block (From/To/Comment + Send + Raw frame)
-* tab**"Server & IGate"**Server (Port/Mode/Start/Presets)
+* tab**"Server & IGate"**Server (Port/Mode/Start/Preset)
   IGate form (APRSIS CLIENT / IGATE NAME / Passcode / Server)
   Port / Filter / Flags / Start-Stop
 * bottom, under the tabs - a common window**"RX/TX Log"**(emphasis + copying)
@@ -419,6 +419,6 @@ window.
 | KISS team classes | `0x01 TXDELAY, 0x02 PERSIST, 0x03 SLOTTIME, 0x04 TXTAIL, 0x05 FULLDUPLEX, 0x06 SETHARDWARE, 0xFF RETURN` |
 | AX.25 UI control/PID | `0x03` / `0xF0` |
 | TCP server ports | KISS 8023 · AGW 8000 · APRS-IS 14580 |
-| IGate client | APRS-IS (default)`d/<IGATE_NAME>*`), settings. json in the module folder |
+| IGate-client | APRS-IS (default)`d/<IGATE_NAME>*`), settings. json in the module folder |
 
 ---
