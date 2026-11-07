@@ -2,7 +2,7 @@
 ==============================================================================
   KISS TNC over BLE  —  GUI app for a TIDRadio TD-H9 APRS radio
   Author:  dkxce (c)  https://github.com/dkxce/Tidradio-TD-H9
-  Version: v1.1.0.0
+  Version: v1.2.0.0
 
   Russian:  Графическое приложение (tkinter) для работы с рацией TD-H9 как
             с KISS TNC через Bluetooth LE: скан устройств, подключение,
@@ -40,11 +40,12 @@ from aprsis_server import APRSServer
 from aprs_parser import parse_aprs
 from ax25 import to_aprs_text, encode_ax25_text
 from igate import IGate, load_settings, save_settings
+from settings_parser import TDH9Image, parse_aprs, build_report
 import mru_store
 import packet_log
 
 __author__ = "dkxce (c) https://github.com/dkxce/Tidradio-TD-H9"
-__version__ = "v1.1.0.0"
+__version__ = "v1.2.0.0"
 
 
 class App:
@@ -113,11 +114,14 @@ class App:
         tab1 = ttk.Frame(self.nb)
         tab2 = ttk.Frame(self.nb)
         tab3 = ttk.Frame(self.nb)
+        tab4 = ttk.Frame(self.nb)
         tab1.configure(height=320)
         tab2.configure(height=320)
         tab3.configure(height=320)
+        tab4.configure(height=320)
         self.nb.add(tab1, text="TNC & TX")
         self.nb.add(tab2, text="Server & IGate")
+        self.nb.add(tab4, text="Settings (APRS)")
         self.nb.add(tab3, text="About")
 
         # ============ Tab 1: device + transmit ============
@@ -218,6 +222,37 @@ class App:
         ig = ttk.LabelFrame(tab2, text="IGate (Radio <-> APRS-IS)")
         ig.pack(fill="x", padx=8, pady=6)
         
+        # ============ Tab 4: download APRS settings ============
+        # Russian: вкладка чтения настроек APRS/GNSS из рации через FF00.
+        # English: tab to download APRS/GNSS settings from the radio (FF00).
+        dl = ttk.LabelFrame(tab4, text="APRS / GNSS settings (read-only, from radio)")
+        dl.pack(fill="x", padx=8, pady=6)
+
+        dlrow = ttk.Frame(dl)
+        dlrow.pack(fill="x", padx=6, pady=4)
+        self.btn_dl = ttk.Button(dlrow, text="Download settings", command=self._download_settings)
+        self.btn_dl.pack(side="left")
+        self.dl_progress = ttk.Progressbar(dlrow, mode="determinate", length=260)
+        self.dl_progress.pack(side="left", padx=8)
+        self.dl_state = ttk.Label(dlrow, text="idle", foreground="gray")
+        self.dl_state.pack(side="left")
+
+        dl_out = ttk.LabelFrame(tab4, text="Parsed settings")
+        dl_out.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        dl_head = ttk.Frame(dl_out)
+        dl_head.pack(fill="x", padx=4, pady=(3, 0))
+        ttk.Label(dl_head, text="(selectable; copy via Ctrl+C or button)").pack(side="left")
+        self.btn_dl_copy = ttk.Button(dl_head, text="Copy all",
+                                      command=self._copy_settings)
+        self.btn_dl_copy.pack(side="right")
+        self.dl_text = tk.Text(dl_out, height=16, wrap="none",
+                               state="disabled",
+                               yscrollcommand=lambda *a: self.dl_scroll.set(*a))
+        self.dl_scroll = ttk.Scrollbar(dl_out, orient="vertical",
+                                       command=self.dl_text.yview)
+        self.dl_scroll.pack(side="right", fill="y")
+        self.dl_text.pack(side="left", fill="both", expand=True)
+
         # ============ Tab 3: About ============
         
         about = ttk.LabelFrame(tab3, text="About")
@@ -226,7 +261,7 @@ class App:
         bold_font = ("TkDefaultFont", 9, "bold")
 
         ttk.Label(about, text="BLE KISS TNC over TCP/IP", font=bold_font).pack(side="top", anchor="w", padx=5, pady=(5, 1))
-        ttk.Label(about, text="Version: v1.1.0").pack(side="top", anchor="w", padx=5, pady=1)
+        ttk.Label(about, text="Version: v1.2.0").pack(side="top", anchor="w", padx=5, pady=1)
         ttk.Label(about, text="Author: dkxce").pack(side="top", anchor="w", padx=5, pady=1)
 
         def create_link_with_prefix(parent, prefix_text, url):
@@ -344,6 +379,9 @@ class App:
         self.ble.on_connect_error = self._on_ble_error
         self.ble.on_rx = self._on_ble_rx
         self.ble.on_services = self._on_services
+        self.ble.on_download = self._on_download_done
+        self.ble.on_download_error = self._on_download_error
+        self.ble.on_download_progress = self._on_download_progress
 
     # ---------------------------------------------------------- UI queue pump
     # Russian: периодически выполняет отложенные обновления интерфейса.
@@ -555,6 +593,71 @@ class App:
             self._log_rx(f"[BLE] Write: {write_uuid}  (handle {write_handle})")
             self._log_rx(f"[BLE] Notify: {notify_uuid}  (handle {notify_handle})")
         self._bus(upd)
+
+    # ---------------------------------------------- download APRS settings
+    # Russian: скачивание настроек APRS/GNSS из рации по FF00 (колбэки ниже).
+    def _download_settings(self):
+        if not self.connected:
+            messagebox.showwarning("Attention", "Connect to a BLE device first.")
+            return
+        self.btn_dl.configure(state="disabled")
+        self.dl_progress.configure(value=0)
+        self.dl_state.configure(text="Downloading...", foreground="orange")
+        self._log_rx("[Settings] downloading full config image (FF00)...")
+        threading.Thread(target=self.ble.download_settings, daemon=True).start()
+
+    def _on_download_progress(self, done, total):
+        def upd():
+            try:
+                self.dl_progress.configure(maximum=total, value=done)
+                self.dl_state.configure(text=f"{done}/{total}", foreground="orange")
+            except Exception:
+                pass
+        self._bus(upd)
+
+    def _on_download_done(self, image: bytes):
+        def upd():
+            try:
+                img = TDH9Image(bytes(image))
+                settings = parse_aprs(img)
+                report = build_report(img, settings)
+                self.dl_text.configure(state="normal")
+                self.dl_text.delete("1.0", tk.END)
+                self.dl_text.insert(tk.END, report + "\n")
+                self.dl_text.configure(state="disabled")
+                self.dl_progress.configure(value=self.dl_progress["maximum"])
+                self.dl_state.configure(text="done", foreground="green")
+                self._log_rx(f"[Settings] parsed {len(image)} bytes, mode {img.mode}")
+            except Exception as e:
+                self._on_download_error(f"parse failed: {e}")
+            finally:
+                self.btn_dl.configure(state="normal")
+        self._bus(upd)
+
+    def _on_download_error(self, msg: str):
+        def upd():
+            self.dl_state.configure(text="error", foreground="red")
+            self.btn_dl.configure(state="normal")
+            self._log_rx(f"[Settings!] {msg}")
+        self._bus(upd)
+
+    # Russian: копирует показанные настройки в системный буфер обмена.
+    # English: copies the displayed settings into the system clipboard.
+    def _copy_settings(self):
+        try:
+            content = self.dl_text.get("1.0", tk.END).strip()
+        except Exception:
+            content = ""
+        if not content:
+            self._log_rx("[Settings] nothing to copy yet")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        try:
+            self.root.update()
+        except Exception:
+            pass
+        self._log_rx("[Settings] copied to clipboard")
 
     # -------------------------------------------------------- incoming KISS data
     # Russian: приём KISS-фреймов по BLE и их отображение.

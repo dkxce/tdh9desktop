@@ -63,6 +63,13 @@ FALLBACK_NOTIFY = [
     "0000ffe1-0000-1000-8000-00805f9b34fb",
 ]
 
+# Clone/programming BLE service (same radio, used to read the full settings
+# image / кодплаг). Russian: сервис программирования FF00 — через него
+# читается полный образ настроек рации (клонирование); те же рации TD-H9.
+SERVICE_FF00 = "0000ff00-0000-1000-8000-00805f9b34fb"
+CHAR_FF_WRITE = "0000ff02-0000-1000-8000-00805f9b34fb"
+CHAR_FF_NOTIFY = "0000ff01-0000-1000-8000-00805f9b34fb"
+
 
 @dataclass
 class BLEDeviceInfo:
@@ -193,6 +200,31 @@ class BLEManager:
     def send_raw(self, data: bytes):
         """Write raw bytes (pre-framed) to the BLE write characteristic."""
         self._submit(self._write_async(data))
+
+    # ------------------------------------------------------- download settings
+    # Russian: чтение полного образа настроек (клонирование) по сервису FF00
+    # на уже открытом соединении. Возвращается callback'ом on_download/on_error.
+    def download_settings(self, on_done=None, on_error=None, progress=None):
+        """Download the full TD-H9 settings image over the FF00 clone service.
+
+        Uses the already-open BLE client (same connection as the TNC), writes
+        commands to ff02 and listens on ff01 just for the duration of the
+        download. Callbacks may be plain functions called from the BLE thread.
+
+        Russian:  Скачивает полный образ настроек рации через сервис FF00 на
+                  уже открытом соединении. ff01 notify подключается только на
+                  время скачивания. Результат в on_done(bytes), ошибка в
+                  on_error(str), прогресс в progress(done,total).
+        """
+        # Russian: не затираем заранее подписанные колбэки (см. _wire_callbacks),
+        # если аргумент равен None. Это частая причина «прогресс не идёт».
+        if on_done is not None:
+            self.on_download = on_done
+        if on_error is not None:
+            self.on_download_error = on_error
+        if progress is not None:
+            self.on_download_progress = progress
+        self._submit(self._download_settings_async())
 
     def close(self):
         self._closing = True
@@ -372,6 +404,149 @@ class BLEManager:
                 await c.write_gatt_char(target, bytearray(data), response=use_response)
             except Exception as e:
                 self._call(self.on_connect_error, f"Write failed: {e}")
+
+    # ------------------------------------------------------- download settings
+    # Russian: чтение полного образа настроек (клонирование) по сервису FF00
+    # на уже открытом соединении. Результат приходит в on_download(bytes).
+    async def _download_settings_async(self):
+        c = self.client
+        if c is None or not c.is_connected:
+            self._call(self.on_download_error, "Not connected")
+            return
+        try:
+            svc = c.services.get_service(SERVICE_FF00)
+            if svc is None:
+                self._call(self.on_download_error, "FF00 clone service not found")
+                return
+            write_ch = None
+            notify_ch = None
+            for ch in svc.characteristics:
+                u = str(ch.uuid).lower()
+                if u == CHAR_FF_WRITE:
+                    write_ch = ch.handle
+                elif u == CHAR_FF_NOTIFY:
+                    notify_ch = ch.handle
+            if write_ch is None or notify_ch is None:
+                self._call(self.on_download_error, "FF02/FF01 not found on FF00 service")
+                return
+
+            # --- handshake (h9toolbox protocol) ---
+            # Russian: рукопожатие и вход в режим клонирования 0x50 56 4F 4A 48 5C 14.
+            # Единый буфер + asyncio-событие: срезаем ровно нужное число байт,
+            # а остаток (хвост предыдущего ответа, склеенный в одном notify)
+            # сохраняем для следующего чтения — как в aprs-setter.
+            import asyncio as _aio
+            incoming = bytearray()
+            wake = _aio.Event()
+
+            async def _notify_cb(_sender, data: bytearray):
+                incoming.extend(bytes(data))
+                wake.set()
+
+            await c.start_notify(notify_ch, _notify_cb)
+
+            async def _read_exact(n, timeout=2.5):
+                # Russian: читаем ровно n байт из общего буфера, остаток храним.
+                out = bytearray()
+                deadline = _aio.get_event_loop().time() + timeout
+                while len(out) < n:
+                    need = n - len(out)
+                    if incoming:
+                        take = incoming[:need]
+                        del incoming[:need]
+                        out += take
+                        continue
+                    if _aio.get_event_loop().time() > deadline:
+                        raise RuntimeError("read timeout")
+                    wake.clear()
+                    try:
+                        await _aio.wait_for(wake.wait(), timeout=deadline - _aio.get_event_loop().time())
+                    except _aio.TimeoutError:
+                        raise RuntimeError("read timeout")
+                return bytes(out)
+
+            # Russian: пишем команду и ждём ACK (0x06).
+            async def _command(data: bytes):
+                await c.write_gatt_char(write_ch, bytearray(data))
+                ack = await _read_exact(1)
+                if ack[0] != 0x06:
+                    raise RuntimeError(f"expected ACK, got {ack.hex()}")
+
+            MAGIC = bytes([0x50, 0x56, 0x4f, 0x4a, 0x48, 0x5c, 0x14])
+            IMAGE_SIZE = 0x3148
+            MEM_SIZE = 0x3140
+            BLOCK = 0x20
+
+            await _command(MAGIC)
+            await c.write_gatt_char(write_ch, bytearray([0x02]))
+            ident = await _read_exact(8)
+            await c.write_gatt_char(write_ch, bytearray([0x06]))
+            ack = await _read_exact(1)
+            if ack[0] != 0x06:
+                raise RuntimeError("programming-mode ACK failed")
+
+            # Russian: state-машина чтения блоков с опциональным байтом
+            # контрольной суммы (h9toolbox). Первый блок определяет режим,
+            # дальше он стабилен; также обрабатывается склейка «хвост
+            # контрольной суммы + заголовок следующего блока».
+            read_mode = "auto"  # 'auto' -> resolves to 'yes'|'no' on first block
+
+            async def _read_block(address):
+                nonlocal read_mode
+                expected = bytes([0x57, (address >> 8) & 255, address & 255, BLOCK])
+                header = await _read_exact(4)
+                # A late checksum from the previous block can precede this header.
+                if header != expected:
+                    nxt = await _read_exact(1)
+                    shifted = bytes([header[1], header[2], header[3], nxt[0]])
+                    if shifted == expected:
+                        header = shifted
+                        read_mode = "yes"
+                if header != expected:
+                    raise RuntimeError(
+                        "Invalid read header at 0x%04x: %s"
+                        % (address, header.hex()))
+                data = await _read_exact(BLOCK)
+                mode = read_mode
+                if mode == "yes":
+                    await _read_exact(1)  # firmware-provided checksum
+                elif mode == "auto":
+                    try:
+                        # Peek for one optional checksum byte (short timeout).
+                        await _read_exact(1, timeout=0.15)
+                        mode = "yes"
+                    except Exception:
+                        mode = "no"
+                    read_mode = mode
+                return data
+
+            image = bytearray(IMAGE_SIZE)
+            image[:8] = ident
+            for address in range(0, MEM_SIZE, BLOCK):
+                # read block command 0x52 addrh addrl len
+                cmd = bytes([0x52, (address >> 8) & 255, address & 255, BLOCK])
+                await c.write_gatt_char(write_ch, bytearray(cmd))
+                data = await _read_block(address)
+                image[address + 8: address + 8 + BLOCK] = data
+                if self.on_download_progress:
+                    try:
+                        self.on_download_progress(address + BLOCK, MEM_SIZE)
+                    except Exception:
+                        pass
+
+            # exit programming mode 0x45
+            try:
+                await c.write_gatt_char(write_ch, bytearray([0x45]))
+            except Exception:
+                pass
+            try:
+                await c.stop_notify(notify_ch)
+            except Exception:
+                pass
+
+            self._call(self.on_download, bytes(image))
+        except Exception as e:
+            self._call(self.on_download_error, f"Download failed: {e}")
 
     # ---------------------------------------------------------------- callbacks
     def _on_notify(self, _sender, data: bytearray):
