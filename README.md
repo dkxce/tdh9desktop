@@ -336,6 +336,7 @@ python main.py
 
 <img src="images/screen1.png"/>    
 <img src="images/screen2.png"/>    
+<img src="images/screen3.png"/>    
 
 ---
 
