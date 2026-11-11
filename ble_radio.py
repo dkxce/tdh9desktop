@@ -117,6 +117,15 @@ class BLEManager:
         self.on_connect_error = None  # (str) -> None
         self.on_rx = None             # (bytes) -> None, raw KISS/APRS bytes
         self.on_services = None       # (list, write_uuid, notify_uuid) -> None
+        self.on_download = None       # (bytes) -> None
+        self.on_download_error = None # (str) -> None
+        self.on_download_progress = None  # (done, total) -> None
+        self.on_upload = None         # () -> None
+        self.on_upload_error = None   # (str) -> None
+        self.on_upload_progress = None    # (done, total) -> None
+        # per-field callbacks (get one setting from the radio)
+        self.on_field_read = None     # (key, raw_bytes) -> None
+        self.on_field_error = None    # (str) -> None
 
         self._closing = False
         self._write_lock = threading.Lock()
@@ -225,6 +234,83 @@ class BLEManager:
         if progress is not None:
             self.on_download_progress = progress
         self._submit(self._download_settings_async())
+
+    # ------------------------------------------------------- upload settings
+    # Russian: запись полного образа настроек (клонирование) по сервису FF00,
+    # либо точечная запись набора изменённых блоков (запись только полей).
+    # Протокол записи блока — как в td9_aprs.py: 0x57 addrh addrl len payload
+    # checksum, затем ACK 0x06 и verify-чтение блока.
+    def upload_settings(self, image: bytes, on_done=None, on_error=None, progress=None):
+        """Write a full TD-H9 settings image (8 + 0x3140 bytes) over FF00.
+
+        Russian:  Записывает полный образ настроек рации (после патча) через
+                  сервис FF00. Результат в on_done(), ошибка в on_error(str).
+        """
+        if on_done is not None:
+            self.on_upload = on_done
+        if on_error is not None:
+            self.on_upload_error = on_error
+        if progress is not None:
+            self.on_upload_progress = progress
+        self._submit(self._upload_settings_async(bytes(image)))
+
+    def upload_field(self, field_off: int, field_bytes: bytes, on_done=None,
+                     on_error=None, progress=None):
+        """Write only the affected 32-byte blocks of one field.
+
+        The field may cross block boundaries; the caller passes the memory
+        offset and the encoded bytes (as from settings_parser.patch_image /
+        td9_aprs.encode_setting). Only the touched blocks are read, patched
+        and written back.
+
+        Russian:  Точечная запись одного поля: читаются только затронутые
+                  блоки, патчатся и записываются обратно. field_off — offset
+                  в памяти (не считая 8-байтного identity).
+        """
+        if on_done is not None:
+            self.on_upload = on_done
+        if on_error is not None:
+            self.on_upload_error = on_error
+        if progress is not None:
+            self.on_upload_progress = progress
+        self._submit(self._upload_field_async(int(field_off), bytes(field_bytes)))
+
+    def download_field(self, field_off: int, field_len: int, field_key: str = "",
+                       on_read=None, on_error=None):
+        """Read only the 32-byte blocks that cover one settings field.
+
+        Enters clone mode, reads the affected blocks, leaves clone mode and
+        hands the caller the exact raw bytes of the field (field_len long).
+
+        Russian:  Точечное чтение одного поля: входит в режим клонирования,
+                  читает только блоки, покрывающие поле, выходит и отдаёт
+                  сырые байты поля длиной field_len через on_read(key, raw).
+        """
+        if on_read is not None:
+            self.on_field_read = on_read
+        if on_error is not None:
+            self.on_field_error = on_error
+        self._submit(self._download_field_async(int(field_off), int(field_len),
+                                                str(field_key)))
+
+    def upload_selected_blocks(self, image: bytes, addrs: list, on_done=None,
+                               on_error=None, progress=None):
+        """Write only the given 32-byte memory blocks from a patched image.
+
+        ``addrs`` is a list of MEMORY offsets (not counting the 8-byte
+        identity). Unlike upload_settings, only the chosen blocks are written;
+        they are taken directly from the provided (already patched) image.
+
+        Russian:  Записывает только выбранные блоки памяти из пропатченного
+                  образа. addrs — адреса в памяти (не считая identity).
+        """
+        if on_done is not None:
+            self.on_upload = on_done
+        if on_error is not None:
+            self.on_upload_error = on_error
+        if progress is not None:
+            self.on_upload_progress = progress
+        self._submit(self._upload_selected_async(bytes(image), [int(a) for a in addrs]))
 
     def close(self):
         self._closing = True
@@ -556,3 +642,483 @@ class BLEManager:
         self.client = None
         self.services_loaded = False
         self._call(self.on_disconnected)
+
+    async def _upload_settings_async(self, image: bytes):
+        """Write the full settings image over FF00 (clone service).
+
+        Russian:  Полная запись образа настроек: вход в режим клонирования,
+                  запись каждого 32-байтного блока (0x57 addrh addrl len
+                  payload chk), ACK 0x06, verify-чтение, выход 0x45.
+        """
+        c = self.client
+        if c is None or not c.is_connected:
+            self._call(self.on_upload_error, "Not connected")
+            return
+        if len(image) != 0x3148:
+            self._call(self.on_upload_error, "Bad image length: %d" % len(image))
+            return
+        try:
+            svc = c.services.get_service(SERVICE_FF00)
+            if svc is None:
+                self._call(self.on_upload_error, "FF00 clone service not found")
+                return
+            write_ch = notify_ch = None
+            for ch in svc.characteristics:
+                u = str(ch.uuid).lower()
+                if u == CHAR_FF_WRITE:
+                    write_ch = ch.handle
+                elif u == CHAR_FF_NOTIFY:
+                    notify_ch = ch.handle
+            if write_ch is None or notify_ch is None:
+                self._call(self.on_upload_error, "FF02/FF01 not found on FF00 service")
+                return
+
+            import asyncio as _aio
+            incoming = bytearray()
+            wake = _aio.Event()
+
+            async def _notify_cb(_sender, data: bytearray):
+                incoming.extend(bytes(data))
+                wake.set()
+
+            await c.start_notify(notify_ch, _notify_cb)
+
+            async def _read_exact(n, timeout=3.0):
+                out = bytearray()
+                deadline = _aio.get_event_loop().time() + timeout
+                while len(out) < n:
+                    need = n - len(out)
+                    if incoming:
+                        take = incoming[:need]
+                        del incoming[:need]
+                        out += take
+                        continue
+                    if _aio.get_event_loop().time() > deadline:
+                        raise RuntimeError("read timeout")
+                    wake.clear()
+                    try:
+                        await _aio.wait_for(wake.wait(),
+                                            timeout=deadline - _aio.get_event_loop().time())
+                    except _aio.TimeoutError:
+                        raise RuntimeError("read timeout")
+                return bytes(out)
+
+            async def _command(data: bytes):
+                await c.write_gatt_char(write_ch, bytearray(data))
+                ack = await _read_exact(1)
+                if ack[0] != 0x06:
+                    raise RuntimeError("expected ACK, got %s" % ack.hex())
+
+            MAGIC = bytes([0x50, 0x56, 0x4f, 0x4a, 0x48, 0x5c, 0x14])
+            MEM_SIZE = 0x3140
+            BLOCK = 0x20
+
+            await _command(MAGIC)
+            await c.write_gatt_char(write_ch, bytearray([0x02]))
+            await _read_exact(8)
+            await c.write_gatt_char(write_ch, bytearray([0x06]))
+            ack = await _read_exact(1)
+            if ack[0] != 0x06:
+                raise RuntimeError("programming-mode ACK failed")
+
+            # write each block: 0x57 addrh addrl len payload chk (sum & 0xFF)
+            for address in range(0, MEM_SIZE, BLOCK):
+                payload = image[8 + address: 8 + address + BLOCK]
+                chk = sum(payload) & 255
+                frame = bytes([0x57, (address >> 8) & 255, address & 255, BLOCK]) \
+                    + payload + bytes([chk])
+                await c.write_gatt_char(write_ch, bytearray(frame))
+                ack = await _read_exact(1, timeout=5.0)
+                if ack[0] != 0x06:
+                    raise RuntimeError("write ack expected at 0x%04x, got %s"
+                                       % (address, ack.hex()))
+                # optional readback verify (same structure as read blocks)
+                try:
+                    await c.write_gatt_char(write_ch, bytearray(
+                        [0x52, (address >> 8) & 255, address & 255, BLOCK]))
+                    expected = bytes([0x57, (address >> 8) & 255, address & 255, BLOCK])
+                    header = await _read_exact(4)
+                    if header == expected:
+                        data = await _read_exact(BLOCK)
+                        try:
+                            await _read_exact(1, timeout=0.15)
+                        except Exception:
+                            pass
+                        if data != payload:
+                            raise RuntimeError("verify mismatch at 0x%04x" % address)
+                except Exception:
+                    # verify is best-effort; some firmwares skip the readback
+                    pass
+                if self.on_upload_progress:
+                    try:
+                        self.on_upload_progress(address + BLOCK, MEM_SIZE)
+                    except Exception:
+                        pass
+
+            try:
+                await c.write_gatt_char(write_ch, bytearray([0x45]))
+            except Exception:
+                pass
+            try:
+                await c.stop_notify(notify_ch)
+            except Exception:
+                pass
+            self._call(self.on_upload)
+        except Exception as e:
+            self._call(self.on_upload_error, "Upload failed: %s" % e)
+
+    async def _upload_selected_async(self, image: bytes, addrs: list):
+        """Write only the given 32-byte memory blocks from a patched image.
+
+        Russian:  Записывает только выбранные блоки памяти (из пропатченного
+                  образа): вход в режим программирования, запись каждого
+                  блока (0x57 addrh addrl len payload chk), ACK, выход 0x45.
+        """
+        c = self.client
+        if c is None or not c.is_connected:
+            self._call(self.on_upload_error, "Not connected")
+            return
+        if len(image) != 0x3148:
+            self._call(self.on_upload_error, "Bad image length: %d" % len(image))
+            return
+        try:
+            svc = c.services.get_service(SERVICE_FF00)
+            if svc is None:
+                self._call(self.on_upload_error, "FF00 clone service not found")
+                return
+            write_ch = notify_ch = None
+            for ch in svc.characteristics:
+                u = str(ch.uuid).lower()
+                if u == CHAR_FF_WRITE:
+                    write_ch = ch.handle
+                elif u == CHAR_FF_NOTIFY:
+                    notify_ch = ch.handle
+            if write_ch is None or notify_ch is None:
+                self._call(self.on_upload_error, "FF02/FF01 not found on FF00 service")
+                return
+
+            import asyncio as _aio
+            incoming = bytearray()
+            wake = _aio.Event()
+
+            async def _notify_cb(_sender, data: bytearray):
+                incoming.extend(bytes(data))
+                wake.set()
+
+            await c.start_notify(notify_ch, _notify_cb)
+
+            async def _read_exact(n, timeout=3.0):
+                out = bytearray()
+                deadline = _aio.get_event_loop().time() + timeout
+                while len(out) < n:
+                    need = n - len(out)
+                    if incoming:
+                        take = incoming[:need]
+                        del incoming[:need]
+                        out += take
+                        continue
+                    if _aio.get_event_loop().time() > deadline:
+                        raise RuntimeError("read timeout")
+                    wake.clear()
+                    try:
+                        await _aio.wait_for(wake.wait(),
+                                            timeout=deadline - _aio.get_event_loop().time())
+                    except _aio.TimeoutError:
+                        raise RuntimeError("read timeout")
+                return bytes(out)
+
+            async def _command(data: bytes):
+                await c.write_gatt_char(write_ch, bytearray(data))
+                ack = await _read_exact(1)
+                if ack[0] != 0x06:
+                    raise RuntimeError("expected ACK, got %s" % ack.hex())
+
+            MAGIC = bytes([0x50, 0x56, 0x4f, 0x4a, 0x48, 0x5c, 0x14])
+            BLOCK = 0x20
+
+            await _command(MAGIC)
+            await c.write_gatt_char(write_ch, bytearray([0x02]))
+            await _read_exact(8)
+            await c.write_gatt_char(write_ch, bytearray([0x06]))
+            ack = await _read_exact(1)
+            if ack[0] != 0x06:
+                raise RuntimeError("programming-mode ACK failed")
+
+            for idx, address in enumerate(addrs):
+                payload = image[8 + address: 8 + address + BLOCK]
+                chk = sum(payload) & 255
+                frame = bytes([0x57, (address >> 8) & 255, address & 255, BLOCK]) \
+                    + payload + bytes([chk])
+                await c.write_gatt_char(write_ch, bytearray(frame))
+                ack = await _read_exact(1, timeout=5.0)
+                if ack[0] != 0x06:
+                    raise RuntimeError("write ack expected at 0x%04x" % address)
+                if self.on_upload_progress:
+                    try:
+                        self.on_upload_progress(idx + 1, len(addrs))
+                    except Exception:
+                        pass
+
+            try:
+                await c.write_gatt_char(write_ch, bytearray([0x45]))
+            except Exception:
+                pass
+            try:
+                await c.stop_notify(notify_ch)
+            except Exception:
+                pass
+            self._call(self.on_upload)
+        except Exception as e:
+            self._call(self.on_upload_error, "Upload selected failed: %s" % e)
+
+    async def _upload_field_async(self, field_off: int, field_bytes: bytes):
+        """Write a single field: read the affected blocks, patch and write back.
+
+        Russian:  Точечная запись поля: аналогично _upload_settings_async, но
+                  читаются и пишутся только блоки, покрывающие поле.
+        """
+        c = self.client
+        if c is None or not c.is_connected:
+            self._call(self.on_upload_error, "Not connected")
+            return
+        try:
+            svc = c.services.get_service(SERVICE_FF00)
+            if svc is None:
+                self._call(self.on_upload_error, "FF00 clone service not found")
+                return
+            write_ch = notify_ch = None
+            for ch in svc.characteristics:
+                u = str(ch.uuid).lower()
+                if u == CHAR_FF_WRITE:
+                    write_ch = ch.handle
+                elif u == CHAR_FF_NOTIFY:
+                    notify_ch = ch.handle
+            if write_ch is None or notify_ch is None:
+                self._call(self.on_upload_error, "FF02/FF01 not found on FF00 service")
+                return
+
+            import asyncio as _aio
+            incoming = bytearray()
+            wake = _aio.Event()
+
+            async def _notify_cb(_sender, data: bytearray):
+                incoming.extend(bytes(data))
+                wake.set()
+
+            await c.start_notify(notify_ch, _notify_cb)
+
+            async def _read_exact(n, timeout=3.0):
+                out = bytearray()
+                deadline = _aio.get_event_loop().time() + timeout
+                while len(out) < n:
+                    need = n - len(out)
+                    if incoming:
+                        take = incoming[:need]
+                        del incoming[:need]
+                        out += take
+                        continue
+                    if _aio.get_event_loop().time() > deadline:
+                        raise RuntimeError("read timeout")
+                    wake.clear()
+                    try:
+                        await _aio.wait_for(wake.wait(),
+                                            timeout=deadline - _aio.get_event_loop().time())
+                    except _aio.TimeoutError:
+                        raise RuntimeError("read timeout")
+                return bytes(out)
+
+            async def _command(data: bytes):
+                await c.write_gatt_char(write_ch, bytearray(data))
+                ack = await _read_exact(1)
+                if ack[0] != 0x06:
+                    raise RuntimeError("expected ACK, got %s" % ack.hex())
+
+            MAGIC = bytes([0x50, 0x56, 0x4f, 0x4a, 0x48, 0x5c, 0x14])
+            BLOCK = 0x20
+
+            await _command(MAGIC)
+            await c.write_gatt_char(write_ch, bytearray([0x02]))
+            await _read_exact(8)
+            await c.write_gatt_char(write_ch, bytearray([0x06]))
+            ack = await _read_exact(1)
+            if ack[0] != 0x06:
+                raise RuntimeError("programming-mode ACK failed")
+
+            # affected blocks
+            start_byte = field_off
+            end_byte = field_off + len(field_bytes)
+            first_addr = (start_byte // BLOCK) * BLOCK
+            last_addr = ((end_byte - 1) // BLOCK) * BLOCK
+            target_addrs = list(range(first_addr, last_addr + 1, BLOCK))
+
+            # read the affected blocks (0x52 command)
+            blocks = {}
+            for addr in target_addrs:
+                cmd = bytes([0x52, (addr >> 8) & 255, addr & 255, BLOCK])
+                await c.write_gatt_char(write_ch, bytearray(cmd))
+                expected = bytes([0x57, (addr >> 8) & 255, addr & 255, BLOCK])
+                header = await _read_exact(4)
+                if header != expected:
+                    raise RuntimeError("Invalid read header at 0x%04x: %s"
+                                       % (addr, header.hex()))
+                data = await _read_exact(BLOCK)
+                try:
+                    await _read_exact(1, timeout=0.15)
+                except Exception:
+                    pass
+                blocks[addr] = bytearray(data)
+
+            # splice the new field bytes into the blocks
+            remaining = bytes(field_bytes)
+            cur = start_byte
+            for addr in target_addrs:
+                lo = max(cur, addr) - addr
+                hi = min(end_byte, addr + BLOCK) - addr
+                if hi > lo:
+                    take = hi - lo
+                    blocks[addr][lo:hi] = remaining[:take]
+                    remaining = remaining[take:]
+                    cur = addr + hi
+
+            # write back
+            for idx, addr in enumerate(target_addrs):
+                payload = bytes(blocks[addr])
+                chk = sum(payload) & 255
+                frame = bytes([0x57, (addr >> 8) & 255, addr & 255, BLOCK]) \
+                    + payload + bytes([chk])
+                await c.write_gatt_char(write_ch, bytearray(frame))
+                ack = await _read_exact(1, timeout=5.0)
+                if ack[0] != 0x06:
+                    raise RuntimeError("write ack expected at 0x%04x" % addr)
+                if self.on_upload_progress:
+                    try:
+                        self.on_upload_progress(idx + 1, len(target_addrs))
+                    except Exception:
+                        pass
+
+            try:
+                await c.write_gatt_char(write_ch, bytearray([0x45]))
+            except Exception:
+                pass
+            try:
+                await c.stop_notify(notify_ch)
+            except Exception:
+                pass
+            self._call(self.on_upload)
+        except Exception as e:
+            self._call(self.on_upload_error, "Upload field failed: %s" % e)
+
+    async def _download_field_async(self, field_off: int, field_len: int,
+                                    field_key: str):
+        """Read a single field: enter clone mode, read affected blocks, exit.
+
+        Russian:  Точечное чтение одного поля — вход в режим клонирования,
+                  чтение только блоков, покрывающих поле, выход 0x45,
+                  затем выдача сырых байт поля в on_field_read(key, raw).
+        """
+        c = self.client
+        if c is None or not c.is_connected:
+            self._call(self.on_field_error, "Not connected")
+            return
+        try:
+            svc = c.services.get_service(SERVICE_FF00)
+            if svc is None:
+                self._call(self.on_field_error, "FF00 clone service not found")
+                return
+            write_ch = notify_ch = None
+            for ch in svc.characteristics:
+                u = str(ch.uuid).lower()
+                if u == CHAR_FF_WRITE:
+                    write_ch = ch.handle
+                elif u == CHAR_FF_NOTIFY:
+                    notify_ch = ch.handle
+            if write_ch is None or notify_ch is None:
+                self._call(self.on_field_error, "FF02/FF01 not found on FF00 service")
+                return
+
+            import asyncio as _aio
+            incoming = bytearray()
+            wake = _aio.Event()
+
+            async def _notify_cb(_sender, data: bytearray):
+                incoming.extend(bytes(data))
+                wake.set()
+
+            await c.start_notify(notify_ch, _notify_cb)
+
+            async def _read_exact(n, timeout=3.0):
+                out = bytearray()
+                deadline = _aio.get_event_loop().time() + timeout
+                while len(out) < n:
+                    need = n - len(out)
+                    if incoming:
+                        take = incoming[:need]
+                        del incoming[:need]
+                        out += take
+                        continue
+                    if _aio.get_event_loop().time() > deadline:
+                        raise RuntimeError("read timeout")
+                    wake.clear()
+                    try:
+                        await _aio.wait_for(wake.wait(),
+                                            timeout=deadline - _aio.get_event_loop().time())
+                    except _aio.TimeoutError:
+                        raise RuntimeError("read timeout")
+                return bytes(out)
+
+            async def _command(data: bytes):
+                await c.write_gatt_char(write_ch, bytearray(data))
+                ack = await _read_exact(1)
+                if ack[0] != 0x06:
+                    raise RuntimeError("expected ACK, got %s" % ack.hex())
+
+            MAGIC = bytes([0x50, 0x56, 0x4f, 0x4a, 0x48, 0x5c, 0x14])
+            BLOCK = 0x20
+
+            await _command(MAGIC)
+            await c.write_gatt_char(write_ch, bytearray([0x02]))
+            await _read_exact(8)
+            await c.write_gatt_char(write_ch, bytearray([0x06]))
+            ack = await _read_exact(1)
+            if ack[0] != 0x06:
+                raise RuntimeError("programming-mode ACK failed")
+
+            start_byte = field_off
+            end_byte = field_off + field_len
+            first_addr = (start_byte // BLOCK) * BLOCK
+            last_addr = ((end_byte - 1) // BLOCK) * BLOCK
+            target_addrs = list(range(first_addr, last_addr + 1, BLOCK))
+
+            blocks = {}
+            for addr in target_addrs:
+                cmd = bytes([0x52, (addr >> 8) & 255, addr & 255, BLOCK])
+                await c.write_gatt_char(write_ch, bytearray(cmd))
+                expected = bytes([0x57, (addr >> 8) & 255, addr & 255, BLOCK])
+                header = await _read_exact(4)
+                if header != expected:
+                    raise RuntimeError("Invalid read header at 0x%04x: %s"
+                                       % (addr, header.hex()))
+                data = await _read_exact(BLOCK)
+                try:
+                    await _read_exact(1, timeout=0.15)
+                except Exception:
+                    pass
+                blocks[addr] = bytearray(data)
+
+            raw = bytes().join(
+                blocks[addr][max(start_byte, addr) - addr:
+                             min(end_byte, addr + BLOCK) - addr]
+                for addr in target_addrs)
+
+            try:
+                await c.write_gatt_char(write_ch, bytearray([0x45]))
+            except Exception:
+                pass
+            try:
+                await c.stop_notify(notify_ch)
+            except Exception:
+                pass
+
+            self._call(self.on_field_read, field_key, raw)
+        except Exception as e:
+            self._call(self.on_field_error, "Read field failed: %s" % e)

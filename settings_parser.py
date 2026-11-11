@@ -23,6 +23,10 @@ import json
 import struct
 from typing import Any, Dict, List, Optional
 
+# td9_aprs has the writable-field table (offsets + encoders); importing it here
+# is safe: bleak is only imported lazily inside td9_aprs functions.
+from td9_aprs import WRITABLE, encode_setting
+
 __author__ = "dkxce (c) https://github.com/dkxce/Tidradio-TD-H9"
 __version__ = "v1.0.0.0"
 
@@ -36,13 +40,13 @@ IMAGE_SIZE = MEM_SIZE + IDENT_SIZE
 
 SSID_CHOICES = {i: str(i) for i in range(16)}
 ICON_TABLE_CHOICES = {0x2F: "Primary /", 0x5C: "Alternate \\"}
-MIC_TYPES = ["Off duty", "En route", "In service", "Returning",
-             "Committed", "Special", "Priority", "Emergency"]
-TX_CHANNEL_CHOICES = {0: "A locked", 1: "B locked", 2: "A auto",
-                      3: "B auto", 4: "A + B"}
-RX_CHANNEL_CHOICES = {0: "Off", 1: "A", 2: "B"}
-DIGI_FWD_CHOICES = {0: "A", 1: "B", 2: "A + B"}
-POS_SOURCE_CHOICES = {0: "Fixed coordinates", 1: "GNSS"}
+MIC_TYPES = ["M0: Off duty", "M1: En route", "M2: In service", "M3: Returning",
+             "M4: Committed", "M5: Special", "M6: Priority", "M7: Emergency"]
+TX_CHANNEL_CHOICES = {0: "CH-A Locked", 1: "CH-B Locked", 2: "CH-A Auto",
+                      3: "CH-B Auto", 4: "CH-A + CH-B"}
+RX_CHANNEL_CHOICES = {0: "Off", 1: "CH-A", 2: "CH-B"}
+DIGI_FWD_CHOICES = {0: "CH-A", 1: "CH-B", 2: "CH-A + CH-B"}
+POS_SOURCE_CHOICES = {0: "Fixed coordinates", 1: "GNSS (GPS)"}
 FORMAT_CHOICES = {0: "Degrees", 1: "Degrees + minutes",
                   2: "Degrees + minutes + seconds"}
 SPEED_CHOICES = {0: "km/h", 1: "knots", 2: "m/s"}
@@ -341,3 +345,44 @@ def build_report(image: TDH9Image, settings: AprsSettings) -> str:
         f"  Remote pwd:    {A.get('remote_password') or '—'}",
     ]
     return "\n".join(lines)
+
+
+def patch_image(image: bytes, changes: Dict[str, Any]) -> bytes:
+    """Apply field changes to a full TD-H9 image (8-byte identity + 0x3140
+    memory).  `changes` maps writable field names to new human values, e.g.
+    {"callsign": "R2AKA", "beacon_interval": "600", "ssid": "7"}.
+
+    Returns a new image bytes object with the patched fields.  Raises
+    KeyError for unknown fields and ValueError for bad values.
+
+    The values are encoded with the same rules as td9_aprs.py ``set``
+    (encode_setting): texts, numbers, on/off and choice labels are accepted.
+    """
+    if len(image) != IMAGE_SIZE:
+        raise ValueError(
+            f"Expected {IMAGE_SIZE} bytes, got {len(image)}.")
+    data = bytearray(image)
+    # memory portion starts at offset 8 (identity header)
+    mem = data[IDENT_SIZE:]
+    for key, value in changes.items():
+        off, enc = encode_setting(key, value)
+        mem[off:off + len(enc)] = enc
+    data[IDENT_SIZE:] = mem
+    return bytes(data)
+
+
+def changed_fields(current: bytes, patched: bytes) -> Dict[str, Any]:
+    """Return the list of writable fields whose bytes differ between two
+    images (used to report which fields were actually changed)."""
+    if len(current) != IMAGE_SIZE or len(patched) != IMAGE_SIZE:
+        raise ValueError("Both images must be full TD-H9 images.")
+    mem_c = current[IDENT_SIZE:]
+    mem_p = patched[IDENT_SIZE:]
+    out = []
+    for key, (off, kind) in WRITABLE.items():
+        length = {"byte": 1, "yesno": 1, "u16le": 2,
+                  "text6": 6, "text8": 8, "text64": 64,
+                  "coord5": 5, "coord4": 4}.get(kind, 1)
+        if mem_c[off:off + length] != mem_p[off:off + length]:
+            out.append(key)
+    return out

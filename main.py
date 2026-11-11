@@ -2,7 +2,7 @@
 ==============================================================================
   KISS TNC over BLE  —  GUI app for a TIDRadio TD-H9 APRS radio
   Author:  dkxce (c)  https://github.com/dkxce/Tidradio-TD-H9
-  Version: v1.2.0.0
+  Version: v1.3.0.0
 
   Russian:  Графическое приложение (tkinter) для работы с рацией TD-H9 как
             с KISS TNC через Bluetooth LE: скан устройств, подключение,
@@ -40,12 +40,16 @@ from aprsis_server import APRSServer
 from aprs_parser import parse_aprs
 from ax25 import to_aprs_text, encode_ax25_text
 from igate import IGate, load_settings, save_settings
-from settings_parser import TDH9Image, parse_aprs, build_report
+from settings_parser import TDH9Image, parse_aprs, build_report, patch_image, changed_fields
+from td9_aprs import (WRITABLE, decode_setting, encode_setting, _KIND_LEN,
+                      SETTINGS_GROUPS, SETTINGS_LABELS, CHOICE_FIELDS, CHOICE_HINTS,
+                      setting_bounds)
+import aprs_icons
 import mru_store
 import packet_log
 
 __author__ = "dkxce (c) https://github.com/dkxce/Tidradio-TD-H9"
-__version__ = "v1.2.0.0"
+__version__ = "v1.3.0.0"
 
 
 class App:
@@ -224,34 +228,159 @@ class App:
         
         # ============ Tab 4: download APRS settings ============
         # Russian: вкладка чтения настроек APRS/GNSS из рации через FF00.
-        # English: tab to download APRS/GNSS settings from the radio (FF00).
-        dl = ttk.LabelFrame(tab4, text="APRS / GNSS settings (read-only, from radio)")
-        dl.pack(fill="x", padx=8, pady=6)
-
-        dlrow = ttk.Frame(dl)
-        dlrow.pack(fill="x", padx=6, pady=4)
-        self.btn_dl = ttk.Button(dlrow, text="Download settings", command=self._download_settings)
-        self.btn_dl.pack(side="left")
-        self.dl_progress = ttk.Progressbar(dlrow, mode="determinate", length=260)
-        self.dl_progress.pack(side="left", padx=8)
-        self.dl_state = ttk.Label(dlrow, text="idle", foreground="gray")
-        self.dl_state.pack(side="left")
-
-        dl_out = ttk.LabelFrame(tab4, text="Parsed settings")
+        # English: tab to download/upload APRS/GNSS settings from the radio (FF00).
+        dl_out = ttk.LabelFrame(tab4, text="APRS / GNSS editable settings")
         dl_out.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         dl_head = ttk.Frame(dl_out)
         dl_head.pack(fill="x", padx=4, pady=(3, 0))
-        ttk.Label(dl_head, text="(selectable; copy via Ctrl+C or button)").pack(side="left")
+        ttk.Label(dl_head,
+                  text="Download from radio, edit fields, then Apply (patch) or Write full image.").pack(
+            side="left")
         self.btn_dl_copy = ttk.Button(dl_head, text="Copy all",
                                       command=self._copy_settings)
         self.btn_dl_copy.pack(side="right")
-        self.dl_text = tk.Text(dl_out, height=16, wrap="none",
-                               state="disabled",
-                               yscrollcommand=lambda *a: self.dl_scroll.set(*a))
-        self.dl_scroll = ttk.Scrollbar(dl_out, orient="vertical",
-                                       command=self.dl_text.yview)
-        self.dl_scroll.pack(side="right", fill="y")
-        self.dl_text.pack(side="left", fill="both", expand=True)
+
+        # progress / status row — always visible above the editable fields
+        dlrow = ttk.Frame(dl_out)
+        dlrow.pack(fill="x", padx=4, pady=(2, 0))
+        self.dl_progress = ttk.Progressbar(dlrow, mode="determinate", length=520)
+        self.dl_progress.pack(side="left", padx=(0, 8))
+        self.dl_pct = ttk.Label(dlrow, text="0%", width=6, anchor="e",
+                                foreground="gray")
+        self.dl_pct.pack(side="left", padx=(0, 8))
+        self.dl_state = ttk.Label(dlrow, text="idle", foreground="gray")
+        self.dl_state.pack(side="left")
+
+        # separator below the progress row / разделитель под прогрессбаром
+        ttk.Separator(dl_out, orient="horizontal").pack(fill="x", padx=4, pady=(2, 0))
+
+        # editable field rows in a scrollable canvas
+        fields_area = ttk.Frame(dl_out)
+        fields_area.pack(fill="both", expand=True, padx=4, pady=(2, 2))
+        self.fields_canvas = tk.Canvas(fields_area, height=200, highlightthickness=0)
+        self.fields_scroll = ttk.Scrollbar(fields_area, orient="vertical",
+                                           command=self.fields_canvas.yview)
+        self.fields_scroll.pack(side="right", fill="y")
+        self.fields_canvas.pack(side="left", fill="both", expand=True)
+        self.fields_canvas.configure(yscrollcommand=self.fields_scroll.set)
+        self.fields_frame = ttk.Frame(self.fields_canvas)
+        self.fields_win = self.fields_canvas.create_window(
+            (0, 0), window=self.fields_frame, anchor="nw")
+        self.fields_frame.bind(
+            "<Configure>",
+            lambda e: self.fields_canvas.configure(scrollregion=self.fields_canvas.bbox("all")))
+
+        self.field_vars = {}    # key -> tk.StringVar (editable field values)
+        self.field_widgets = {}  # key -> row widget (for enable/disable)
+        self.field_buttons = {}  # key -> (btn_get, btn_set)
+        self._tips = {}          # widget -> tooltip window (stack)
+
+        def _make_tip(widget, text):
+            """Show a simple tooltip on hover / всплывающая подсказка при наведении."""
+            tip = None
+
+            def _enter(_e):
+                nonlocal tip
+                try:
+                    if tip is not None:
+                        tip.destroy()
+                except Exception:
+                    pass
+                tip = tk.Toplevel(widget)
+                tip.wm_overrideredirect(True)
+                tip.geometry("+%d+%d" % (widget.winfo_rootx() + 18,
+                                         widget.winfo_rooty() + 18))
+                ttk.Label(tip, text=text, wraplength=420, justify="left",
+                          background="#ffffe0", relief="solid",
+                          borderwidth=1).pack(padx=4, pady=4)
+
+            def _leave(_e):
+                nonlocal tip
+                if tip is not None:
+                    try:
+                        tip.destroy()
+                    except Exception:
+                        pass
+                    tip = None
+
+            widget.bind("<Enter>", _enter)
+            widget.bind("<Leave>", _leave)
+
+        # build one labelled group per logical section
+        for group_title, keys in SETTINGS_GROUPS:
+            grp = ttk.LabelFrame(self.fields_frame, text=group_title)
+            grp.pack(fill="x", padx=2, pady=(3, 1))
+            for key, label, kind in keys:
+                off = WRITABLE[key][0]
+                kind_str = WRITABLE[key][1]
+                row = ttk.Frame(grp)
+                row.pack(fill="x", padx=4, pady=1)
+                ttk.Label(row, text="%s:" % label, width=26, anchor="w").pack(side="left")
+                var = tk.StringVar(value="")
+                choices = CHOICE_FIELDS.get(key)
+                if key in ("icon_symbol", "icon_table"):
+                    # Icon Settings / SSID Symbol: read-only combo showing the
+                    # icon label + a "..." button that opens the icon picker.
+                    # Russian: поле иконки и поле таблицы символов — комбобокс с
+                    # кнопкой открытия справочника иконок APRS (оба синхронно
+                    # обновляют и таблицу, и саму иконку).
+                    combo = ttk.Combobox(row, textvariable=var, width=28,
+                                         values=[], state="readonly")
+                    combo.pack(side="left", padx=4)
+                    combo.bind("<Button-1>",
+                               lambda e, k=key: self._pick_icon(k) or "break")
+                    btn_icons = ttk.Button(row, text="...", width=3,
+                                           command=lambda k=key: self._pick_icon(k))
+                    btn_icons.pack(side="left", padx=(2, 0))
+                    self._icons_btn = btn_icons
+                    edit = combo
+                elif choices:
+                    # preset dropdown / выпадающий список предустановленных значений
+                    combo = ttk.Combobox(row, textvariable=var, width=28,
+                                         values=list(choices), state="readonly")
+                    combo.pack(side="left", padx=4)
+                    edit = combo
+                else:
+                    # entry 31 chars ≈ combobox 28 chars + arrow, same pixel width
+                    ent = ttk.Entry(row, textvariable=var, width=31)
+                    ent.pack(side="left", padx=4)
+                    edit = ent
+                hint = CHOICE_HINTS.get(key)
+                if hint:
+                    ttk.Label(row, text="?", foreground="blue", cursor="question_arrow",
+                              width=2).pack(side="left")
+                    self._make_tip = _make_tip  # keep helper reachable
+                    _make_tip(row.winfo_children()[-1], hint)
+                ttk.Label(row, text="@0x%04X %s" % (off, kind_str), width=18,
+                          foreground="gray").pack(side="left")
+                # per-field Get (read from radio) / Set (write one field)
+                btn_get = ttk.Button(row, text="Get", width=5,
+                                     command=lambda k=key: self._get_field(k))
+                btn_get.pack(side="left", padx=(4, 0))
+                btn_set = ttk.Button(row, text="Set", width=5,
+                                     command=lambda k=key: self._set_field(k))
+                btn_set.pack(side="left", padx=(2, 0))
+                self.field_buttons[key] = (btn_get, btn_set)
+                self.field_vars[key] = var
+                self.field_widgets[key] = (row, edit)
+
+        # separator before the action buttons / разделитель перед кнопками
+        ttk.Separator(dl_out, orient="horizontal").pack(fill="x", padx=4, pady=(2, 2))
+
+        # action buttons — full width panel below the fields
+        dl_btns = ttk.Frame(dl_out)
+        dl_btns.pack(fill="x", padx=4, pady=(0, 3))
+        self.btn_dl_fields = ttk.Button(dl_btns, text="Download settings",
+                                        command=self._download_settings)
+        self.btn_dl_fields.pack(side="left")
+        self.btn_apply_patch = ttk.Button(dl_btns, text="Apply changes (patch)",
+                                          command=self._apply_patch_changes,
+                                          state="disabled")
+        self.btn_apply_patch.pack(side="left", padx=6)
+        self.btn_write_full = ttk.Button(dl_btns, text="Write full image",
+                                         command=self._write_full_image,
+                                         state="disabled")
+        self.btn_write_full.pack(side="left", padx=6)
 
         # ============ Tab 3: About ============
         
@@ -261,7 +390,7 @@ class App:
         bold_font = ("TkDefaultFont", 9, "bold")
 
         ttk.Label(about, text="BLE KISS TNC over TCP/IP", font=bold_font).pack(side="top", anchor="w", padx=5, pady=(5, 1))
-        ttk.Label(about, text="Version: v1.2.0").pack(side="top", anchor="w", padx=5, pady=1)
+        ttk.Label(about, text="Version: v1.3.0").pack(side="top", anchor="w", padx=5, pady=1)
         ttk.Label(about, text="Author: dkxce").pack(side="top", anchor="w", padx=5, pady=1)
 
         def create_link_with_prefix(parent, prefix_text, url):
@@ -382,6 +511,11 @@ class App:
         self.ble.on_download = self._on_download_done
         self.ble.on_download_error = self._on_download_error
         self.ble.on_download_progress = self._on_download_progress
+        self.ble.on_upload = self._on_upload_done
+        self.ble.on_upload_error = self._on_upload_error
+        self.ble.on_upload_progress = self._on_upload_progress
+        self.ble.on_field_read = self._on_field_read
+        self.ble.on_field_error = self._on_field_error
 
     # ---------------------------------------------------------- UI queue pump
     # Russian: периодически выполняет отложенные обновления интерфейса.
@@ -600,8 +734,9 @@ class App:
         if not self.connected:
             messagebox.showwarning("Attention", "Connect to a BLE device first.")
             return
-        self.btn_dl.configure(state="disabled")
+        self.btn_dl_fields.configure(state="disabled")
         self.dl_progress.configure(value=0)
+        self.dl_pct.configure(text="0%")
         self.dl_state.configure(text="Downloading...", foreground="orange")
         self._log_rx("[Settings] downloading full config image (FF00)...")
         threading.Thread(target=self.ble.download_settings, daemon=True).start()
@@ -610,6 +745,8 @@ class App:
         def upd():
             try:
                 self.dl_progress.configure(maximum=total, value=done)
+                pct = int(done * 100.0 / total) if total else 0
+                self.dl_pct.configure(text="%d%%" % pct)
                 self.dl_state.configure(text=f"{done}/{total}", foreground="orange")
             except Exception:
                 pass
@@ -618,34 +755,48 @@ class App:
     def _on_download_done(self, image: bytes):
         def upd():
             try:
-                img = TDH9Image(bytes(image))
-                settings = parse_aprs(img)
-                report = build_report(img, settings)
-                self.dl_text.configure(state="normal")
-                self.dl_text.delete("1.0", tk.END)
-                self.dl_text.insert(tk.END, report + "\n")
-                self.dl_text.configure(state="disabled")
+                self._image = TDH9Image(bytes(image))
+                settings = parse_aprs(self._image)
+                base = {}
+                # fill the editable fields from the raw image
+                for key, var in self.field_vars.items():
+                    try:
+                        off, kind = WRITABLE[key]
+                        length = _KIND_LEN.get(kind, 1)
+                        val = decode_setting(key, self._image._mem[off:off + length])
+                    except Exception:
+                        val = settings.labels.get(key, "")
+                    val = str(val).replace("—", "")
+                    var.set(val)
+                    base[key] = val
+                self._base_values = base
+                # enable write buttons
+                self.btn_apply_patch.configure(state="normal")
+                self.btn_write_full.configure(state="normal")
                 self.dl_progress.configure(value=self.dl_progress["maximum"])
+                self.dl_pct.configure(text="100%")
                 self.dl_state.configure(text="done", foreground="green")
-                self._log_rx(f"[Settings] parsed {len(image)} bytes, mode {img.mode}")
+                self._log_rx(f"[Settings] parsed {len(image)} bytes, mode {self._image.mode}")
             except Exception as e:
                 self._on_download_error(f"parse failed: {e}")
             finally:
-                self.btn_dl.configure(state="normal")
+                self.btn_dl_fields.configure(state="normal")
         self._bus(upd)
 
     def _on_download_error(self, msg: str):
         def upd():
             self.dl_state.configure(text="error", foreground="red")
-            self.btn_dl.configure(state="normal")
+            self.btn_dl_fields.configure(state="normal")
             self._log_rx(f"[Settings!] {msg}")
         self._bus(upd)
 
-    # Russian: копирует показанные настройки в системный буфер обмена.
-    # English: copies the displayed settings into the system clipboard.
+    # Russian: копирует значения редактируемых полей в системный буфер обмена.
+    # English: copies the editable field values into the system clipboard.
     def _copy_settings(self):
         try:
-            content = self.dl_text.get("1.0", tk.END).strip()
+            lines = ["%s = %s" % (k, self.field_vars[k].get())
+                     for k in sorted(self.field_vars)]
+            content = "\n".join(lines)
         except Exception:
             content = ""
         if not content:
@@ -658,6 +809,264 @@ class App:
         except Exception:
             pass
         self._log_rx("[Settings] copied to clipboard")
+
+    # ------------------------------------------------- upload settings methods
+    # Russian: запись настроек обратно в рацию — двумя способами:
+    #   1) Apply changes (patch): изменённые поля собираются в patched image,
+    #      записываются ТОЛЬКО блоки, покрывающие изменённые поля.
+    #   2) Write full image: патч добавляется так же, но пишутся ВСЕ блоки.
+    def _collect_changes(self) -> dict:
+        """Collect edited field values into a {key: value} dict.
+
+        Only fields whose value differs from the last downloaded state are
+        returned (empty string entries are ignored).
+
+        Russian:  Собирает изменённые поля: только те, значение которых
+                  отличается от последнего скачанного состояния.
+        """
+        base = getattr(self, "_base_values", {})
+        changes = {}
+        for key, var in self.field_vars.items():
+            val = var.get().strip()
+            if val and val != base.get(key, ""):
+                changes[key] = val
+        return changes
+
+    def _apply_patch_changes(self):
+        if not self.connected:
+            messagebox.showwarning("Attention", "Connect to a BLE device first.")
+            return
+        if not hasattr(self, "_image"):
+            messagebox.showinfo("Settings", "Download settings first.")
+            return
+        changes = self._collect_changes()
+        if not changes:
+            messagebox.showinfo("Settings", "No fields edited.")
+            return
+        try:
+            patched = patch_image(bytes(self._image._image), changes)
+        except Exception as e:
+            messagebox.showerror("Settings", "Cannot encode changes: %s" % e)
+            return
+        changed = changed_fields(bytes(self._image._image), patched)
+        self._log_rx("[Settings] patch: changed fields: %s" % (", ".join(changed) or "none"))
+        self._upload_blocks_for_fields(bytes(self._image._image), patched)
+
+    def _write_full_image(self):
+        if not self.connected:
+            messagebox.showwarning("Attention", "Connect to a BLE device first.")
+            return
+        if not hasattr(self, "_image"):
+            messagebox.showinfo("Settings", "Download settings first.")
+            return
+        changes = self._collect_changes()
+        try:
+            patched = patch_image(bytes(self._image._image), changes)
+        except Exception as e:
+            messagebox.showerror("Settings", "Cannot encode changes: %s" % e)
+            return
+        self._log_rx("[Settings] writing full image to radio...")
+        self.btn_apply_patch.configure(state="disabled")
+        self.btn_write_full.configure(state="disabled")
+        threading.Thread(
+            target=self.ble.upload_settings,
+            args=(patched,),
+            kwargs={"on_done": self._on_upload_done,
+                    "on_error": self._on_upload_error,
+                    "progress": self._on_upload_progress},
+            daemon=True,
+        ).start()
+
+    def _upload_blocks_for_fields(self, current: bytes, patched: bytes):
+        """Write only the blocks covering the changed fields (patch mode)."""
+        from td9_aprs import _KIND_LEN
+        changed = changed_fields(current, patched)
+        if not changed:
+            self._log_rx("[Settings] nothing changed")
+            return
+        self.btn_apply_patch.configure(state="disabled")
+        self.btn_write_full.configure(state="disabled")
+        # collect unique target blocks
+        targets = set()
+        for key in changed:
+            off = WRITABLE[key][0]
+            length = _KIND_LEN[WRITABLE[key][1]]
+            first = (off // 32) * 32
+            last = ((off + length - 1) // 32) * 32
+            for a in range(first, last + 1, 32):
+                targets.add(a)
+        self._log_rx("[Settings] patch: writing blocks %s" %
+                     ", ".join("0x%04X" % a for a in sorted(targets)))
+        # build a full patched image and reuse upload_settings on it, but that
+        # writes all blocks. Instead we write only target blocks here.
+        threading.Thread(
+            target=self._upload_blocks_thread,
+            args=(bytes(patched), sorted(targets)),
+            daemon=True,
+        ).start()
+
+    def _upload_blocks_thread(self, patched: bytes, addrs: list):
+        # write only the chosen blocks using the BLE upload machinery
+        # (entry programming, write block 0x57, ack, exit).
+        try:
+            self.ble.upload_selected_blocks(patched, addrs,
+                                            on_done=self._on_upload_done,
+                                            on_error=self._on_upload_error,
+                                            progress=self._on_upload_progress)
+        except Exception as e:
+            self._on_upload_error("upload blocks failed: %s" % e)
+
+    def _on_upload_done(self):
+        def upd():
+            self.dl_progress.configure(value=self.dl_progress["maximum"])
+            self.dl_pct.configure(text="100%")
+            self.dl_state.configure(text="written", foreground="green")
+            self.btn_apply_patch.configure(state="normal")
+            self.btn_write_full.configure(state="normal")
+            self._log_rx("[Settings] written to radio. Power-cycle or restart APRS.")
+        self._bus(upd)
+
+    def _on_upload_error(self, msg: str):
+        def upd():
+            self.dl_pct.configure(text="0%")
+            self.dl_state.configure(text="error", foreground="red")
+            self.btn_apply_patch.configure(state="normal")
+            self.btn_write_full.configure(state="normal")
+            self._log_rx(f"[Settings!] {msg}")
+        self._bus(upd)
+
+    def _on_upload_progress(self, done, total):
+        def upd():
+            try:
+                self.dl_progress.configure(maximum=total, value=done)
+                pct = int(done * 100.0 / total) if total else 0
+                self.dl_pct.configure(text="%d%%" % pct)
+                self.dl_state.configure(text=f"writing {done}/{total}", foreground="orange")
+            except Exception:
+                pass
+        self._bus(upd)
+
+    # ------------------------------------------------ per-field get / set
+    # Russian: точечное чтение (Get) и запись (Set) одной настройки из рации.
+    # English: read/write a single setting from the radio (field-by-field).
+    def _pick_icon(self, key):
+        """Open the APRS icon dialog and store "N: /symbol" in the field var.
+
+        Russian:  Открывает справочник иконок APRS; выбранная иконка
+                  записывается в переменную поля как "N: /symbol".
+        """
+        try:
+            cur = self.field_vars[key].get()
+            index = 0
+            import re as _re
+            m = _re.match(r"\s*(\d+)\s*:", cur)
+            if m:
+                index = int(m.group(1))
+            table = "primary"
+            table_val = self.field_vars.get("icon_table", None)
+            if table_val is not None and str(table_val.get()).startswith("Alternate"):
+                table = "secondary"
+            res = aprs_icons.choose_icon(self.root, index=index, table=table)
+        except Exception:
+            res = None
+        if res:
+            idx, sym, name, _png = res
+            label = "%d: %s" % (idx, sym)
+            if name:
+                label += " - %s" % name
+            # Choosing an icon also sets the symbol table (Primary / or
+            # Alternate \), so SSID Symbol and Icon Settings stay in sync.
+            # Russian: выбор иконки обновляет и таблицу символов (Primary/), и
+            #          саму иконку — SSID Symbol и Icon Settings остаются вместе.
+            if sym.startswith("\\"):
+                table = "secondary"
+            else:
+                table = "primary"
+            tbl = self.field_vars.get("icon_table", None)
+            if tbl is not None:
+                tbl.set("Alternate \\" if table == "secondary" else "Primary /")
+            # the icon label always lives in icon_symbol ("Icon Setting"); the
+            # icon_table field ("SSID Symbol") only holds Primary / / Alternate \.
+            # Russian: метка иконки всегда пишется в icon_symbol (Icon Setting),
+            #          поле icon_table (SSID Symbol) хранит только Primary/ / Alternate\.
+            sym_var = self.field_vars.get("icon_symbol", None)
+            if sym_var is not None:
+                sym_var.set(label)
+
+    def _get_field(self, key):
+        """Read one field from the radio (download_field) and show its value.
+        Читает одно поле из рации (download_field) и показывает значение."""
+        if not self.connected:
+            messagebox.showwarning("Attention", "Connect to a BLE device first.")
+            return
+        try:
+            off, length = setting_bounds(key)
+        except KeyError as e:
+            messagebox.showerror("Settings", str(e))
+            return
+        self._set_buttons_state(key, "disabled")
+        self.dl_state.configure(text=f"reading {key}...", foreground="orange")
+        self._log_rx(f"[Settings] get {key} @0x{off:04X} ...")
+        self.ble.download_field(off, length, key)
+
+    def _set_field(self, key):
+        """Write one field's current value to the radio (upload_field).
+        Записывает текущее значение одного поля в рацию (upload_field)."""
+        if not self.connected:
+            messagebox.showwarning("Attention", "Connect to a BLE device first.")
+            return
+        val = self.field_vars[key].get().strip()
+        if not val:
+            messagebox.showinfo("Settings", f"Field '{key}' is empty.")
+            return
+        try:
+            off, enc = encode_setting(key, val)
+        except Exception as e:
+            messagebox.showerror("Settings", f"Cannot encode '{key}': {e}")
+            return
+        self._set_buttons_state(key, "disabled")
+        self.dl_state.configure(text=f"writing {key}...", foreground="orange")
+        self._log_rx(f"[Settings] set {key} = {val!r} @0x{off:04X} ...")
+        self.ble.upload_field(off, enc,
+                              on_done=lambda: self._on_field_written(key)
+
+        )
+
+    def _set_buttons_state(self, key, state):
+        """Enable/disable the Get/Set buttons of one field row."""
+        btns = self.field_buttons.get(key)
+        if btns:
+            for b in btns:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
+
+    def _on_field_written(self, key):
+        def upd():
+            self._set_buttons_state(key, "normal")
+            self.dl_state.configure(text="written", foreground="green")
+            self._log_rx(f"[Settings] field '{key}' written. Power-cycle or restart APRS.")
+        self._bus(upd)
+
+    def _on_field_read(self, key, raw):
+        def upd():
+            self._set_buttons_state(key, "normal")
+            try:
+                val = decode_setting(key, bytes(raw))
+            except Exception as e:
+                val = ""
+                self._log_rx(f"[Settings!] decode '{key}' failed: {e}")
+            self.field_vars[key].set(val)
+            self.dl_state.configure(text="read", foreground="green")
+            self._log_rx(f"[Settings] {key} = {val!r}")
+        self._bus(upd)
+
+    def _on_field_error(self, msg):
+        def upd():
+            self.dl_state.configure(text="error", foreground="red")
+            self._log_rx(f"[Settings!] {msg}")
+        self._bus(upd)
 
     # -------------------------------------------------------- incoming KISS data
     # Russian: приём KISS-фреймов по BLE и их отображение.
